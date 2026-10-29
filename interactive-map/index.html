@@ -1207,6 +1207,174 @@ if (typeof window !== 'undefined') window.SubwayEngine = SubwayEngine;
 </script>
 <script>
 /* =====================================================================
+ * 지하철 생태 아카이브 — 검지 회전 제스처 인식 (영상 팝업 종료용)
+ *
+ * MediaPipe Gesture Recognizer가 주는 손 랜드마크(21점)만 사용합니다. 별도 모델 학습 없음.
+ *  1) 자세: 검지만 편 상태 — 분류 결과 'Pointing_Up' 또는 랜드마크 판정(검지 펴짐 + 중지·약지·새끼 접힘)
+ *  2) 움직임: 검지 끝(8번)의 이동 경로가 한 방향으로 약 330° 이상 회전
+ *     - 손 크기(손목 0 ↔ 중지 뿌리 9 거리)로 정규화 → 카메라 거리와 무관
+ *     - 경로를 주축 기준으로 정규화(타원 → 원)해 각도를 계산 → 비스듬히 본 원(납작한 타원)도 인식
+ *     - 짧은 축이 너무 작으면(일직선 움직임) 회전으로 보지 않음
+ *  손마다 따로 추적하므로 왼손·오른손, 시계·반시계, 거울 모드 여부와 관계없이 같은 기준으로 판정합니다.
+ * ===================================================================== */
+(function (root) {
+  const ROTATION_DEFAULTS = {
+    // 자세 판정
+    POINTING_MIN_SCORE: 0.5,   // 'Pointing_Up' 분류 신뢰도 하한
+    IDX_EXT_MIN: 1.4,          // 검지 펴짐: |끝-손목| / |뿌리-손목| (참고 영상: 편 상태 1.7~2.0, 주먹 0.8)
+    IDX_STRAIGHT_MIN: 0.85,    // 검지 곧음: 뿌리→끝 직선거리 / 마디 길이 합 (편 상태 ≈1.0, 주먹 ≈0.3)
+    OTHER_FOLD_MAX: 1.15,      // 중지·약지·새끼 접힘: |끝-손목| / |뿌리-손목| (참고 영상 0.5~0.8, 편 손 ≈1.9)
+    POSE_STABLE_MS: 200,       // 검지 자세가 이 시간 이상 이어진 뒤부터 회전 기록
+    POSE_GRACE_MS: 250,        // 회전 중 자세 인식이 잠깐 흔들려도 이 시간까지는 기록 유지
+    HAND_LOST_MS: 300,         // 손이 이 시간 동안 안 보이면 기록 초기화
+
+    // 회전 판정
+    TARGET_DEG: 330,           // 한 방향 누적 회전 각도
+    MIN_TURN_MS: 400,          // 한 바퀴에 걸린 시간 하한 (참고 영상 한 바퀴 ≈ 0.65초)
+    MAX_TURN_MS: 2500,         // 한 바퀴에 걸린 시간 상한
+    WINDOW_MS: 2500,           // 경로 분석 구간
+    STATS_MS: 1200,            // 회전 중심·주축 계산에 쓰는 최근 구간 (참고 영상 기준: 시작 후 약 1초 안에 인식)
+    DIR_CONSISTENCY: 0.8,      // 반대 방향 회전 비율 허용치 (한 방향 각도 / 전체 각도)
+    MIN_RADIUS: 0.15,          // 평균 회전 반경 하한 (손 크기 단위) — 작은 원도 인식
+    MIN_MINOR: 0.06,           // 경로의 짧은 축 표준편차 하한 (손 크기 단위) — 일직선 움직임 제외
+    MAX_AXIS_RATIO: 8,         // 긴 축 / 짧은 축 상한
+    MIN_STEP: 0.008,           // 이보다 작은 이동은 떨림으로 보고 무시 (손 크기 단위)
+    STILL_SPEED: 0.3,          // 손 크기/초 — 이보다 느린 상태가
+    STILL_MS: 600,             //            이 시간 이어지면 회전 중단으로 보고 기록 초기화
+    SCALE_SMOOTH: 0.2,         // 손 크기 평활
+  };
+
+  const d2 = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+
+  /** 랜드마크(픽셀 좌표 배열 [[x,y]…21])로 검지 자세 판정 */
+  function pointingPose(P, cfg) {
+    const w = P[0];
+    const ext = (tip, mcp) => d2(P[tip], w) / Math.max(1e-6, d2(P[mcp], w));
+    const idx = ext(8, 5);
+    const straight = d2(P[5], P[8]) / Math.max(1e-6, d2(P[5], P[6]) + d2(P[6], P[7]) + d2(P[7], P[8]));
+    const mid = ext(12, 9), ring = ext(16, 13), pinky = ext(20, 17);
+    const ok = idx >= cfg.IDX_EXT_MIN && straight >= cfg.IDX_STRAIGHT_MIN &&
+      mid <= cfg.OTHER_FOLD_MAX && ring <= cfg.OTHER_FOLD_MAX && pinky <= cfg.OTHER_FOLD_MAX;
+    return { ok, idx, straight, mid, ring, pinky };
+  }
+
+  function createRotationTracker(overrides) {
+    const cfg = Object.assign({}, ROTATION_DEFAULTS, overrides || {});
+    let samples = [];            // {t, x, y} — 손 크기 단위
+    let scale = 0, poseSince = -1, lastPoseAt = -1e9, lastSeen = -1e9, lastMoveAt = -1e9, lastDeg = 0;
+
+    function reset(keepPose) {
+      samples = []; lastDeg = 0;
+      if (!keepPose) { poseSince = -1; lastPoseAt = -1e9; }
+    }
+
+    /** 경로 분석: 조건을 만족하면 {deg, dir, ms} 반환, 아니면 진행 각도만 */
+    function analyse(now) {
+      const n = samples.length;
+      if (n < 6) return { deg: 0 };
+      // 중심·주축은 최근 STATS_MS 구간으로 계산 (회전 시작 전 손을 옮기던 움직임의 영향 배제)
+      let k0 = 0;
+      while (k0 < n - 6 && now - samples[k0].t > cfg.STATS_MS) k0++;
+      const m = n - k0;
+      let cx = 0, cy = 0;
+      for (let k = k0; k < n; k++) { cx += samples[k].x; cy += samples[k].y; }
+      cx /= m; cy /= m;
+      let sxx = 0, syy = 0, sxy = 0;
+      for (let k = k0; k < n; k++) { const dx = samples[k].x - cx, dy = samples[k].y - cy; sxx += dx * dx; syy += dy * dy; sxy += dx * dy; }
+      sxx /= m; syy /= m; sxy /= m;
+      // 공분산 고유값 분해 → 주축
+      const tr = sxx + syy, det = sxx * syy - sxy * sxy;
+      const disc = Math.sqrt(Math.max(0, tr * tr / 4 - det));
+      const l1 = tr / 2 + disc, l2 = Math.max(0, tr / 2 - disc);
+      const major = Math.sqrt(l1), minor = Math.sqrt(l2);
+      if (minor < cfg.MIN_MINOR || major / Math.max(minor, 1e-6) > cfg.MAX_AXIS_RATIO) return { deg: 0 };
+      let ex = 1, ey = 0;
+      if (Math.abs(sxy) > 1e-12) { ex = l1 - syy; ey = sxy; const L = Math.hypot(ex, ey); ex /= L; ey /= L; }
+      else if (syy > sxx) { ex = 0; ey = 1; }
+      // 정규화 좌표(타원 → 원)에서의 각도
+      const ang = samples.map(s => {
+        const dx = s.x - cx, dy = s.y - cy;
+        const u = (dx * ex + dy * ey) / major, v = (-dx * ey + dy * ex) / minor;
+        return Math.atan2(v, u);
+      });
+      // 가장 최근부터 거슬러 올라가며 누적 → 목표 각도에 처음 도달하는 구간 찾기
+      let sum = 0, pos = 0, neg = 0, rsum = 0, best = 0;
+      const target = cfg.TARGET_DEG * Math.PI / 180;
+      for (let i = n - 1; i > 0; i--) {
+        let da = ang[i] - ang[i - 1];
+        if (da > Math.PI) da -= 2 * Math.PI; else if (da < -Math.PI) da += 2 * Math.PI;
+        sum += da; if (da > 0) pos += da; else neg -= da;
+        rsum += Math.hypot(samples[i].x - cx, samples[i].y - cy);
+        best = Math.max(best, Math.abs(sum));
+        if (Math.abs(sum) >= target) {
+          const ms = now - samples[i - 1].t;
+          const consistency = Math.abs(sum) / Math.max(1e-6, pos + neg);
+          const radius = rsum / (n - i);
+          const ok = ms >= cfg.MIN_TURN_MS && ms <= cfg.MAX_TURN_MS &&
+            consistency >= cfg.DIR_CONSISTENCY && radius >= cfg.MIN_RADIUS;
+          if (ok) return { deg: Math.abs(sum) * 180 / Math.PI, dir: sum > 0 ? 1 : -1, ms, fire: true, radius, consistency };
+          break;
+        }
+      }
+      return { deg: best * 180 / Math.PI };
+    }
+
+    /**
+     * 한 프레임 입력. lm: 픽셀 좌표 랜드마크 [[x,y]…21] (없으면 null = 손 없음)
+     * gesture/score: 이 손의 분류 결과. 반환: { pointing, deg, fired, info }
+     */
+    function update(t, lm, gesture, score) {
+      if (!lm) {
+        if (t - lastSeen > cfg.HAND_LOST_MS) reset(false);
+        return { pointing: false, deg: 0, fired: false };
+      }
+      lastSeen = t;
+      const pose = pointingPose(lm, cfg);
+      const byClass = gesture === 'Pointing_Up' && score >= cfg.POINTING_MIN_SCORE;
+      const pointingNow = pose.ok || byClass;
+      if (pointingNow) {
+        if (poseSince < 0) poseSince = t;
+        lastPoseAt = t;
+      } else if (t - lastPoseAt > cfg.POSE_GRACE_MS) {
+        reset(false);
+        return { pointing: false, pointingNow: false, deg: 0, fired: false, pose };
+      }
+      const pointing = pointingNow || t - lastPoseAt <= cfg.POSE_GRACE_MS;
+      if (poseSince < 0 || t - poseSince < cfg.POSE_STABLE_MS) return { pointing, pointingNow, deg: 0, fired: false, pose };
+      // 자세 인식이 잠깐 흔들린 프레임: 기록은 유지하되 그 프레임의 좌표는 쓰지 않음 (잘못된 손가락 위치 배제)
+      if (!pointingNow) return { pointing, pointingNow, deg: lastDeg, fired: false, pose };
+
+      // 손 크기 (평활) 와 검지 끝 위치 (손 크기 단위)
+      const s = d2(lm[0], lm[9]);
+      scale = scale ? scale + (s - scale) * cfg.SCALE_SMOOTH : s;
+      const x = lm[8][0] / scale, y = lm[8][1] / scale;
+      const last = samples[samples.length - 1];
+      if (last) {
+        const step = Math.hypot(x - last.x, y - last.y);
+        const speed = step / Math.max(1e-3, (t - last.t) / 1000);
+        if (speed >= cfg.STILL_SPEED) lastMoveAt = t;
+        else if (t - lastMoveAt > cfg.STILL_MS) { samples = []; lastMoveAt = t; }
+        if (step < cfg.MIN_STEP) return { pointing, pointingNow, deg: lastDeg, fired: false, pose };
+      } else lastMoveAt = t;
+      samples.push({ t, x, y });
+      while (samples.length && t - samples[0].t > cfg.WINDOW_MS) samples.shift();
+      const a = analyse(t);
+      lastDeg = a.deg;
+      if (a.fire) { samples = []; lastDeg = 0; return { pointing, pointingNow, deg: a.deg, fired: true, info: a, pose }; }
+      return { pointing, pointingNow, deg: a.deg, fired: false, pose };
+    }
+
+    return { update, reset: () => reset(false), cfg };
+  }
+
+  const api = { createRotationTracker, pointingPose, ROTATION_DEFAULTS };
+  if (typeof module !== 'undefined') module.exports = api;
+  else root.SubwayRotation = api;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+/* =====================================================================
  * 지하철 생태 아카이브 — 손동작 인식 + 개별영상 팝업 (확장 모듈)
  *
  * 기존 노선 인터랙티브(engine.js / app.js)는 그대로 두고, 그 위에 오버레이 레이어만 추가합니다.
@@ -1282,6 +1450,11 @@ if (typeof window !== 'undefined') window.SubwayEngine = SubwayEngine;
     CURSOR_SMOOTH: 0.35,       // 커서 위치 지수 평활 (0~1, 클수록 즉각 반응)
     MOUSE_FALLBACK: true,      // 카메라가 없을 때 마우스로 테스트
     SHOW_HOVER_RING: true,     // 커서가 선택 범위 안일 때 교차지점 둘레에 원 표시 (false = 커서만)
+
+    // 검지 회전으로 영상 닫기 — 세부 판정값은 rotation.js 상단 ROTATION_DEFAULTS, 여기서 덮어쓰기 가능
+    NUM_HANDS: 2,              // 동시에 추적하는 손 수 (손마다 회전 기록을 따로 관리)
+    ROTATION: {},              // 예: { TARGET_DEG: 300, MIN_RADIUS: 0.12 }
+    MOUSE_ROTATE_SCALE: 60,    // 마우스 테스트: 오른쪽 버튼으로 그리는 원을 손 크기 60px 기준으로 판정
   };
 
   /* ---------- 팝업 크기 · 프레임 위치 계산 ---------- */
@@ -1324,7 +1497,7 @@ if (typeof window !== 'undefined') window.SubwayEngine = SubwayEngine;
   camEl.setAttribute('muted', ''); camEl.setAttribute('playsinline', ''); camEl.setAttribute('aria-hidden', 'true');
   document.body.appendChild(camEl);
   // 상태 값은 화면에 표시하지 않고 내부에만 보관 (개발 확인용: window.__subwayGesture.status, 브라우저 콘솔)
-  const status = { input: '준비 중', hand: '—', gesture: '—', target: '—', playing: '대기' };
+  const status = { input: '준비 중', hand: '—', gesture: '—', target: '—', playing: '대기', rotation: '—' };
   const setStatus = (k, v) => {
     if (status[k] === v) return;
     status[k] = v;
@@ -1377,7 +1550,7 @@ if (typeof window !== 'undefined') window.SubwayEngine = SubwayEngine;
       // 등장: 다음 프레임에 클래스 추가 → opacity 0→1, scale 0.96→1 (0.5초)
       requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('show')));
 
-      video.addEventListener('ended', () => this.close());
+      video.addEventListener('ended', () => this.close('ended'));
       video.addEventListener('error', () => this.fail());
       video.addEventListener('playing', () => {
         p.started = true;
@@ -1407,11 +1580,14 @@ if (typeof window !== 'undefined') window.SubwayEngine = SubwayEngine;
       p.timers.push(setTimeout(() => this.close(), CFG.FALLBACK_SHOW_MS));
     },
 
-    close() {
+    /** 영상 자연 종료·안내 후 종료·검지 회전 종료가 모두 이 함수 하나로 닫힘 (중복 호출 무시) */
+    close(reason) {
       const p = this.active;
-      if (!p || p.closing) return;
+      if (!p || p.closing) return false;
       p.closing = true;
       p.timers.forEach(clearTimeout);
+      try { p.video.pause(); } catch (e) {}   // 소리가 남지 않도록 즉시 정지
+      setStatus('playing', p.ch + (reason === 'gesture' ? ' 닫는 중 (검지 회전)' : ' 닫는 중'));
       p.el.style.transitionDuration = CFG.POPUP_FADE_OUT + 'ms';
       p.el.classList.remove('show');
       p.el.classList.add('hide');
@@ -1421,7 +1597,9 @@ if (typeof window !== 'undefined') window.SubwayEngine = SubwayEngine;
         if (this.active === p) this.active = null;
         this.closedAt = performance.now();
         setStatus('playing', '대기');
+        onPopupClosed();
       }, CFG.POPUP_FADE_OUT + 20);
+      return true;
     },
   };
 
@@ -1458,7 +1636,10 @@ if (typeof window !== 'undefined') window.SubwayEngine = SubwayEngine;
     const ok = inp.score >= CFG.MIN_SCORE;
     const needOpen = inp.source === 'mouse' ? 1 : CFG.OPEN_FRAMES;
     const needFist = inp.source === 'mouse' ? 1 : CFG.FIST_FRAMES;
-    if (ok && inp.gesture === 'Open_Palm') {
+    if (inp.pointing) {
+      // 검지 세운 자세: 커서는 움직이되 잡기는 해제 (주먹으로 잘못 분류돼도 팝업이 열리지 않음)
+      G.armed = false; G.openStreak = 0; G.fistStreak = 0;
+    } else if (ok && inp.gesture === 'Open_Palm') {
       G.openStreak++; G.fistStreak = 0;
       if (G.openStreak >= needOpen) { G.armed = true; G.lastOpenAt = t; G.lastOpenTarget = G.hover; }
     } else if (ok && inp.gesture === 'Closed_Fist') {
@@ -1477,6 +1658,24 @@ if (typeof window !== 'undefined') window.SubwayEngine = SubwayEngine;
     if (Popup.busy()) { flash('재생 중 — 잡기 무시'); return; }
     Popup.open(target.ch);
   }
+  /* ---------- 검지 회전 → 영상 닫기 ---------- */
+  const Rot = window.SubwayRotation;
+  const trackers = new Map();             // 손별 회전 기록 (왼손/오른손 분리)
+  const trackerFor = key => {
+    let tr = trackers.get(key);
+    if (!tr) { tr = Rot.createRotationTracker(CFG.ROTATION); trackers.set(key, tr); }
+    return tr;
+  };
+  function closeByRotation(key) {
+    if (!Popup.active || Popup.active.closing) return;   // 재생 중일 때만 유효, 닫히는 중이면 무시
+    setStatus('rotation', key + ' 회전 인식 → 닫기');
+    Popup.close('gesture');
+  }
+  function onPopupClosed() {
+    trackers.forEach(tr => tr.reset());   // 닫힘 완료 후 제스처 기록 초기화
+    G.armed = false; G.openStreak = 0; G.fistStreak = 0;   // 다시 손을 편 뒤에만 다음 잡기
+  }
+
   let flashTimer = 0;
   function flash(msg) {
     setStatus('target', msg);
@@ -1502,7 +1701,17 @@ if (typeof window !== 'undefined') window.SubwayEngine = SubwayEngine;
   }
 
   /* ---------- 마우스 대체 입력 ---------- */
-  let cameraLive = false, mouseDown = false;
+  let cameraLive = false, mouseDown = false, mouseRotate = false;
+  // 마우스 테스트용 검지 손 모양 (손목 기준, 손 크기 1 단위) — 오른쪽 버튼 드래그 시 이 손이 커서를 따라 움직임
+  const POINT_HAND = [[0,0],[-0.45,-0.25],[-0.6,-0.55],[-0.55,-0.8],[-0.4,-0.9],[-0.35,-1],[-0.35,-1.45],[-0.35,-1.75],[-0.35,-2],
+    [0,-1],[0.05,-1.2],[0.1,-0.9],[0,-0.7],[0.3,-0.95],[0.32,-1.1],[0.35,-0.85],[0.3,-0.65],[0.55,-0.85],[0.58,-0.95],[0.58,-0.75],[0.5,-0.6]];
+  function mouseRotateFrame(p, down) {
+    const s = CFG.MOUSE_ROTATE_SCALE, tip = POINT_HAND[8];
+    const lm = POINT_HAND.map(([x, y]) => [p.x + (x - tip[0]) * s, p.y + (y - tip[1]) * s]);
+    const r = trackerFor('mouse').update(performance.now(), down ? lm : null, 'Pointing_Up', 1);
+    setStatus('rotation', `mouse ${Math.round(r.deg)}°`);
+    if (r.fired) closeByRotation('mouse');
+  }
   function stagePoint(ev) {
     const r = stage.getBoundingClientRect();
     return { x: (ev.clientX - r.left) / r.width * CFG.VIEW_W, y: (ev.clientY - r.top) / r.height * CFG.VIEW_H };
@@ -1511,16 +1720,36 @@ if (typeof window !== 'undefined') window.SubwayEngine = SubwayEngine;
     stage.addEventListener('pointermove', ev => {
       if (cameraLive && G.source === 'camera' && G.present) return;
       const p = stagePoint(ev);
+      if (mouseRotate) {
+        feed({ present: true, ...p, gesture: 'Pointing_Up', score: 1, source: 'mouse', pointing: true });
+        mouseRotateFrame(p, true);
+        return;
+      }
       feed({ present: true, ...p, gesture: mouseDown ? 'Closed_Fist' : 'Open_Palm', score: 1, source: 'mouse' });
     });
+    stage.addEventListener('contextmenu', ev => ev.preventDefault());
     stage.addEventListener('pointerdown', ev => {
       if (cameraLive && G.source === 'camera' && G.present) return;
-      mouseDown = true;
       const p = stagePoint(ev);
+      if (ev.button === 2) {                 // 오른쪽 버튼: 검지 회전 시험
+        mouseRotate = true;
+        trackerFor('mouse').reset();
+        feed({ present: true, ...p, gesture: 'Pointing_Up', score: 1, source: 'mouse', pointing: true });
+        mouseRotateFrame(p, true);
+        return;
+      }
+      if (ev.button !== 0) return;
+      mouseDown = true;
       feed({ present: true, ...p, gesture: 'Open_Palm', score: 1, source: 'mouse' });
       feed({ present: true, ...p, gesture: 'Closed_Fist', score: 1, source: 'mouse' });
     });
     window.addEventListener('pointerup', ev => {
+      if (mouseRotate && ev.button === 2) {
+        mouseRotate = false;
+        trackerFor('mouse').reset();
+        feed({ present: true, ...stagePoint(ev), gesture: 'Open_Palm', score: 1, source: 'mouse' });
+        return;
+      }
       if (!mouseDown) return;
       mouseDown = false;
       const p = stagePoint(ev);
@@ -1528,6 +1757,52 @@ if (typeof window !== 'undefined') window.SubwayEngine = SubwayEngine;
     });
     stage.addEventListener('pointerleave', () => {
       if (G.source === 'mouse') feed({ present: false, source: 'mouse', t: performance.now() + CFG.HAND_LOST_MS + 1 });
+    });
+  }
+
+  /* ---------- 카메라 한 프레임 결과 처리 (MediaPipe GestureRecognizerResult) ---------- */
+  function handleResult(res, now, vw, vh) {
+    const m = CFG.CAMERA_MARGIN;
+    const all = (res && res.landmarks) || [];
+    const sides = (res && (res.handedness || res.handednesses)) || [];
+    
+    // 손별 정보: 손바닥 중심(손목 + 손가락 뿌리 4개 평균), 분류 결과, 검지 자세, 손 구분 키
+    const hands = all.map((lm, i) => {
+      let cx = 0, cy = 0;
+      for (const j of [0, 5, 9, 13, 17]) { cx += lm[j].x; cy += lm[j].y; }
+      const top = res.gestures && res.gestures[i] && res.gestures[i][0];
+      const side = sides[i] && sides[i][0] ? sides[i][0].categoryName : 'Hand';
+      const px = lm.map(p => [p.x * vw, p.y * vh]);
+      return { i, cx: cx / 5, cy: cy / 5, px, side,
+        gesture: top ? top.categoryName : 'None', score: top ? top.score : 0 };
+    });
+    // 손 구분 키: 왼손/오른손 라벨 (같은 라벨이 둘이면 순서 번호를 붙여 기록이 섞이지 않게)
+    const seen = {};
+    hands.forEach(h => { seen[h.side] = (seen[h.side] || 0) + 1; h.key = seen[h.side] > 1 ? h.side + h.i : h.side; });
+    // 회전 판정: 손마다 독립적으로, 보이지 않는 손은 '없음'으로 갱신
+    const live = new Set();
+    for (const h of hands) {
+      live.add(h.key);
+      const r = trackerFor(h.key).update(now, h.px, h.gesture, h.score);
+      h.pointing = !!r.pointingNow;   // 잡기 안전장치는 이 프레임의 자세만 사용 (유예 시간 미적용)
+      if (r.deg > 0) setStatus('rotation', `${h.key} ${Math.round(r.deg)}°`);
+      if (r.fired) closeByRotation(h.key);
+    }
+    trackers.forEach((tr, key) => { if (key !== 'mouse' && !live.has(key)) tr.update(now, null); });
+    if (!hands.length) { feed({ present: false, source: 'camera', t: now }); return; }
+    // 커서는 한 손만: 직전 커서 손과 가장 가까운 손 (처음엔 첫 번째 손)
+    let primary = hands[0];
+    if (hands.length > 1 && G.present && G.source === 'camera') {
+      let bd = Infinity;
+      for (const h of hands) { const d = Math.hypot(h.cx - G.rawX, h.cy - G.rawY); if (d < bd) { bd = d; primary = h; } }
+    }
+    G.rawX = primary.cx; G.rawY = primary.cy;
+    const u = Math.min(1, Math.max(0, ((1 - primary.cx) - m) / (1 - 2 * m)));   // 거울 모드
+    const v = Math.min(1, Math.max(0, (primary.cy - m) / (1 - 2 * m)));
+    feed({
+      present: true, x: u * CFG.VIEW_W, y: v * CFG.VIEW_H,
+      gesture: primary.pointing ? 'Pointing_Up' : primary.gesture, score: primary.score,
+      pointing: primary.pointing, source: 'camera', t: now,
     });
   }
 
@@ -1555,7 +1830,7 @@ if (typeof window !== 'undefined') window.SubwayEngine = SubwayEngine;
       const files = await mp.FilesetResolver.forVisionTasks(`${base}/wasm`);
       const make = delegate => mp.GestureRecognizer.createFromOptions(files, {
         baseOptions: { modelAssetPath: CFG.MODEL_URL, delegate },
-        runningMode: 'VIDEO', numHands: 1,
+        runningMode: 'VIDEO', numHands: CFG.NUM_HANDS,
       });
       try { recognizer = await make('GPU'); } catch (e) { recognizer = await make('CPU'); }
     } catch (e) {
@@ -1575,20 +1850,7 @@ if (typeof window !== 'undefined') window.SubwayEngine = SubwayEngine;
       const now = performance.now();
       let res;
       try { res = recognizer.recognizeForVideo(camEl, now); } catch (e) { return; }
-      const lm = res && res.landmarks && res.landmarks[0];
-      if (!lm) { feed({ present: false, source: 'camera', t: now }); return; }
-      // 손바닥 중심 (손목 + 손가락 뿌리 4개 평균) — 펼침/쥠과 무관하게 안정적
-      const idx = [0, 5, 9, 13, 17];
-      let cx = 0, cy = 0;
-      for (const i of idx) { cx += lm[i].x; cy += lm[i].y; }
-      cx /= idx.length; cy /= idx.length;
-      const u = Math.min(1, Math.max(0, ((1 - cx) - m) / (1 - 2 * m)));   // 거울 모드
-      const v = Math.min(1, Math.max(0, (cy - m) / (1 - 2 * m)));
-      const top = res.gestures && res.gestures[0] && res.gestures[0][0];
-      feed({
-        present: true, x: u * CFG.VIEW_W, y: v * CFG.VIEW_H,
-        gesture: top ? top.categoryName : 'None', score: top ? top.score : 0, source: 'camera', t: now,
-      });
+      handleResult(res, now, camEl.videoWidth || 640, camEl.videoHeight || 480);
     };
     requestAnimationFrame(loop);
   }
@@ -1597,7 +1859,7 @@ if (typeof window !== 'undefined') window.SubwayEngine = SubwayEngine;
   startCamera();
 
   // 확인용 훅 (화면에는 영향 없음)
-  window.__subwayGesture = { CFG, FRAMES, CARD: { w: CARD_W, h: CARD_H, video: [VIDEO_W, CFG.VIDEO_H] }, feed, Popup, state: G, status, camEl };
+  window.__subwayGesture = { CFG, FRAMES, CARD: { w: CARD_W, h: CARD_H, video: [VIDEO_W, CFG.VIDEO_H] }, feed, Popup, state: G, status, camEl, trackers, trackerFor, closeByRotation, handleResult };
 })();
 
 </script>
